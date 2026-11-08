@@ -2,23 +2,34 @@
 
 Этот форк несёт локальные правки поверх upstream
 [`vectorize-io/hindsight`](https://github.com/vectorize-io/hindsight)
-(`hindsight-integrations/hermes`). База — 1.2.4, SHA `f14cc1eb5624b0374cb4d82768eb2e0b9c21ae24`.
+(`hindsight-integrations/hermes`). База — upstream `main` на момент переноса (`0bd550153`);
+каталог плагина в нём не менялся с релиза 1.2.4 (`f14cc1eb`), поэтому код патча тот же.
 
-Ветка с патчами: **`hermes-local`**. Первый коммит поверх апстрима — `local: Hermes memory patches`
-(в нём всё перечисленное ниже), дальше — обычная история.
+Ветка с патчами: **`hermes-local`** (дефолтная ветка форка). Первый коммит поверх апстрима —
+`local: Hermes memory patches` (в нём всё перечисленное ниже), дальше — обычная история.
 
 ## Как обновляться с апстрима
 
 ```bash
+cd /opt/data/repos/hindsight-fork
 git fetch upstream                       # remote на vectorize-io/hindsight
 git rebase upstream/main                 # или merge, если так удобнее
 # конфликты почти всегда в __init__.py — правки помечены комментариями «локальная доработка»
-git push origin hermes-local
+git push --force-with-lease origin hermes-local
 ```
 
-Если ветка `hermes-local` — дефолтная ветка форка, `hermes plugins update hindsight`
-подтянет её одной командой; иначе ставьте плагин с `--ref <sha>` из этой ветки и обновляйте
-вручную (пин отключает авто-обновление).
+Затем переустановить плагин из форка (подкаталожная установка не имеет `.git`, поэтому
+`plugins update` упирается в подтверждение зависимостей и в неинтерактивном режиме
+отказывается — проще переустановить):
+
+```bash
+hermes plugins install DmitriyKonenkow/hindsight/hindsight-integrations/hermes \
+  --force --yes-deps --enable
+hermes memory status          # Status: available
+```
+
+`hermes plugins update hindsight` тоже работает, но требует терминала: он спрашивает
+согласие на установку зависимостей (`y`).
 
 ## Что именно пропатчено
 
