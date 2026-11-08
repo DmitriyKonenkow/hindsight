@@ -81,6 +81,97 @@ from .settings import (
 
 logger = logging.getLogger(__name__)
 
+# ── Injection audit log (локальная доработка, не апстрим) ──────────────────────
+# Инъекция памяти не сохраняется ни в state.db, ни в логах промпта, поэтому
+# измерить пользу памяти постфактум невозможно. Пишем JSONL: что recall вернул,
+# по какому запросу и когда — join с ходами делает scripts/hindsight_usage.py.
+# Путь переопределяется HINDSIGHT_INJECT_LOG; файл ротируется по размеру.
+_INJECT_LOG_PATH = os.environ.get(
+    "HINDSIGHT_INJECT_LOG",
+    os.path.join(get_hermes_home(), "logs", "hindsight_inject.jsonl"),
+)
+_INJECT_LOG_LOCK = threading.Lock()
+_INJECT_LOG_MAX_BYTES = 32 * 1024 * 1024
+
+
+def _log_injection(record: dict) -> None:
+    """Append one injection record; never let audit logging break a turn."""
+    try:
+        path = Path(_INJECT_LOG_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _INJECT_LOG_LOCK:
+            if path.exists() and path.stat().st_size > _INJECT_LOG_MAX_BYTES:
+                path.replace(path.with_name(path.name + ".1"))
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 - audit must be best-effort
+        logger.debug("injection audit log write failed", exc_info=True)
+
+
+# Журнал гашений: каждое retire/restore пишется отдельно, чтобы отмену памяти можно было
+# разобрать постфактум (что погасили, по какой причине, какие факты затронуты).
+_RETIRE_LOG_PATH = os.environ.get(
+    "HINDSIGHT_RETIRE_LOG",
+    os.path.join(get_hermes_home(), "logs", "hindsight_retire.jsonl"),
+)
+
+
+def _log_retire(record: dict) -> None:
+    """Append one retire record; never let the audit break the tool call."""
+    try:
+        path = Path(_RETIRE_LOG_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _INJECT_LOG_LOCK:
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 - audit must be best-effort
+        logger.debug("retire audit log write failed", exc_info=True)
+
+
+def _injection_item(result) -> dict:
+    return {
+        "id": getattr(result, "id", None) or getattr(result, "memory_id", None),
+        "type": getattr(result, "type", None) or getattr(result, "fact_type", None),
+        "score": getattr(result, "score", None),
+        "mentioned_at": str(getattr(result, "mentioned_at", "") or "")[:10],
+        "text": (getattr(result, "text", "") or "")[:2000],
+    }
+
+
+# ── Auto-recall gating (локальная доработка) ───────────────────────────────────
+# Auto-recall запускается на КАЖДЫЙ ход, включая уведомления фоновых процессов,
+# отчёты крона и односложные реплики. На таких ходах у запроса нет извлекаемого
+# смысла, и реранкер всё равно отдаёт высокий скор случайным фактам (замер:
+# "06:25" -> 0.97 на правиле, где встретилось время "06:23"; "да" -> 0.50).
+# Судья за сутки: 5 из 18 вердиктов "unused" — ровно эти ходы, плюс впрыски на
+# 19-22 факта. Пропуск таких запросов убирает шум, ничего не теряя: явный
+# hindsight_recall и содержательные вопросы работают как раньше.
+_SKIP_RECALL_PREFIXES = ("[important:", "cronjob response:", "[system:", "[background")
+_SKIP_RECALL_MIN_CHARS = 12
+
+
+def _recall_worth_asking(query: str) -> bool:
+    """Whether an auto-recall on *query* can return anything useful at all."""
+    if os.environ.get("HINDSIGHT_RECALL_SKIP_SYSTEM", "1") == "0":
+        return True
+    q = (query or "").strip()
+    if len(q) < _SKIP_RECALL_MIN_CHARS:
+        return False
+    return not q.lower().startswith(_SKIP_RECALL_PREFIXES)
+
+
+def _recall_line(result) -> str:
+    """One injected line, prefixed with the date the fact was recorded.
+
+    Без даты модель видит решение от 3 ноября и отменяющее его решение от 7-го
+    как два равноправных утверждения — оба harmful-вердикта судьи ровно об этом.
+    """
+    text = getattr(result, "text", "") or ""
+    when = str(getattr(result, "mentioned_at", "") or "")[:10]
+    return f"- [{when}] {text}" if when[:2] == "20" else f"- {text}"
+
+
+
 _LOCAL_MODES = {"local", "local_embedded"}
 # Share of the operation timeout an extra recall bank may use, so a slow extra bank
 # always gives up before the operation that also carries the primary's result does.
@@ -405,6 +496,41 @@ REFLECT_SCHEMA = {
     },
 }
 
+RETIRE_SCHEMA = {
+    "name": "hindsight_retire",
+    "description": (
+        "Retire a memory the current context proves wrong or superseded, or restore one retired by "
+        "mistake. Pass a distinctive fragment of the memory text exactly as it appeared in the "
+        "recalled block. Retiring invalidates the underlying fact(s) — observations derived from "
+        "them are dropped and re-consolidated from what remains; the fact stays in the archive and "
+        "`action='restore'` brings it back."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "text": {
+                "type": "string",
+                "description": "Distinctive fragment (10+ chars) of the memory line to retire/restore.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "What in the current context contradicts it (recorded on the memory).",
+            },
+            "action": {
+                "type": "string",
+                "enum": ["retire", "restore"],
+                "description": "Default 'retire'.",
+            },
+            "ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "For action='restore': exact memory ids returned by the retire call (restores them all).",
+            },
+        },
+        "required": ["text"],
+    },
+}
+
 
 def _bank_not_written_yet(exc: Exception) -> bool:
     """Hindsight answers 404 for a bank nothing has been retained to yet. Read off the status rather
@@ -592,6 +718,11 @@ class HindsightMemoryProvider(MemoryProvider):
         # land in the next session.
         self._prefetch_generation = 0
         self._last_recall_returned, self._last_recall_count = False, 0
+        # Audit: what the last recall returned (items) and what the pending
+        # prefetch block was built from — see _log_injection.
+        self._last_recall_items: List[Any] = []
+        self._prefetch_items: List[Any] = []
+        self._prefetch_query = ""
         self._apply_recall_settings({})
 
     @property
@@ -1766,20 +1897,48 @@ class HindsightMemoryProvider(MemoryProvider):
         try:
             if self._prefetch_method == "reflect":
                 logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
+                self._last_recall_items = []
                 return self._reflect(query) or "", 0
             logger.debug(
                 "Recall: calling recall (bank=%s, query_len=%d, budget=%s)", self._bank_id, len(query), self._budget
             )
             results = self._recall(query)
+            self._last_recall_items = list(results)
             logger.debug("Recall: returned %d results", len(results))
-            return "\n".join(f"- {r.text}" for r in results if r.text), len(results)
+            # Кап на число строк: сервер отдаёт до 4096 токенов, и на запросах вроде
+            # «дай ssh ключ» это 19–22 факта, из которых судья признал использованным
+            # один. p90 впрыска — 6 строк, поэтому кап 8 бьёт только по выбросам.
+            limit = _parse_int_setting(os.environ.get("HINDSIGHT_RECALL_MAX_ITEMS"), 8)
+            lines = [_recall_line(r) for r in results if getattr(r, "text", None)]
+            return "\n".join(lines[:limit]), min(len(lines), limit)
         except Exception as e:
             logger.warning("Hindsight recall failed: %s", e, exc_info=True)
             return "", 0
 
-    def _finish_prefetch(self, result: str, count: int) -> str:
+    def _finish_prefetch(
+        self,
+        result: str,
+        count: int,
+        items: Optional[List[Any]] = None,
+        recall_query: str = "",
+        session_id: str = "",
+    ) -> str:
         """Record indicator state (cleared on empty turns, never a stale count); format the block."""
         self._last_recall_returned, self._last_recall_count = bool(result), count if result else 0
+        _log_injection(
+            {
+                "ts": time.time(),
+                "session_id": session_id or getattr(self, "_session_id", "") or "",
+                "query": (recall_query or "")[:4000],
+                "injected": bool(result),
+                "count": count if result else 0,
+                "chars": len(result),
+                "mode": "sync" if self._recall_sync else "async",
+                "method": self._prefetch_method,
+                "items": [_injection_item(r) for r in (items or [])][:40],
+                "text": "" if items else result[:4000],
+            }
+        )
         if not result:
             logger.debug("Prefetch: no results available")
             return ""
@@ -1787,7 +1946,12 @@ class HindsightMemoryProvider(MemoryProvider):
         header = self._recall_prompt_preamble or (
             "# Hindsight Memory (persistent cross-session context)\n"
             "Use this to answer questions about the user and prior sessions. "
-            "Do not call tools to look up information that is already present here."
+            "Do not call tools to look up information that is already present here. "
+            "Each line starts with the date the fact was recorded: when two lines conflict, "
+            "the newer one is the current decision and the older may have been superseded. "
+            "When a line contradicts what the user just said or what a tool shows, the current context wins: "
+            "retire a plainly wrong fact with hindsight_retire (reason required); for a decision the user "
+            "reversed without saying so, ask first and retire it after they confirm."
         )
         return f"{header}\n\n{result}"
 
@@ -1802,14 +1966,22 @@ class HindsightMemoryProvider(MemoryProvider):
         # Opt-in: recall synchronously against the *current* message so the
         # injected memories match this turn's query, not the previous turn's.
         # See NousResearch/hermes-agent#5820.
+        if not _recall_worth_asking(query):
+            return self._finish_prefetch("", 0, [], query, session_id)
         if self._recall_sync:
-            return self._finish_prefetch(*(("", 0) if self._recall_disabled() else self._do_recall(query)))
+            if self._recall_disabled():
+                return self._finish_prefetch("", 0, [], query, session_id)
+            text, count = self._do_recall(query)
+            return self._finish_prefetch(text, count, list(self._last_recall_items), query, session_id)
         # Default: the background worker's result for the previous turn (capped join).
         self._join_prefetch(3.0, log=True)
         with self._prefetch_lock:
             result, count = self._prefetch_result, self._prefetch_count
+            items = list(self._prefetch_items)
+            recall_query = self._prefetch_query
             self._prefetch_result, self._prefetch_count = "", 0
-        return self._finish_prefetch(result, count)
+            self._prefetch_items, self._prefetch_query = [], ""
+        return self._finish_prefetch(result, count, items, recall_query or query, session_id)
 
     def recall_status(self) -> Optional[RecallStatus]:
         """Count injected by the last prefetch; None if nothing injected or ``recall_indicator=false``."""
@@ -1819,7 +1991,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         # Sync mode recalls live each turn — nothing to prime in the background.
-        if self._recall_sync or self._recall_disabled():
+        if self._recall_sync or self._recall_disabled() or not _recall_worth_asking(query):
             return
         # A late call for a session we already left must not prime (or bump the generation of) this one (#5628).
         if session_id and session_id != self._session_id:
@@ -1835,10 +2007,12 @@ class HindsightMemoryProvider(MemoryProvider):
             if self._prefetch_waits_for_retain:
                 self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
             text, count = self._do_recall(query)
+            items = list(self._last_recall_items)
             if text:
                 with self._prefetch_lock:
                     if generation == self._prefetch_generation:
                         self._prefetch_result, self._prefetch_count = text, count
+                        self._prefetch_items, self._prefetch_query = items, query
 
         self._prefetch_thread = spawn_context_thread(_run, name="hindsight-prefetch")
         self._prefetch_thread.start()
@@ -2103,7 +2277,9 @@ class HindsightMemoryProvider(MemoryProvider):
     # -- tools -------------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [] if self._memory_mode == "context" else [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
+        if self._memory_mode == "context":
+            return []
+        return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA, RETIRE_SCHEMA]
 
     def _tool_retain(self, args: dict) -> str:
         content, context = args["content"], args.get("context")
@@ -2143,11 +2319,108 @@ class HindsightMemoryProvider(MemoryProvider):
         logger.debug("Tool hindsight_reflect: response_len=%d", len(text))
         return text or "No relevant memories found."
 
+    # -- retire (локальная доработка) ---------------------------------------------
+    # Наблюдения курировать нельзя (`PATCH` -> 400 «only world/experience facts can be
+    # curated»), поэтому гасим ИСХОДНЫЕ факты наблюдения (у них есть source_memory_ids),
+    # а `clear_memory_observations` сбрасывает производные наблюдения и запускает
+    # пересборку. Проверено на чистом банке: старое знание исчезает, новое остаётся.
+    def _tool_retire(self, args: dict) -> str:
+        import difflib
+
+        text = (args.get("text") or "").strip()
+        action = (args.get("action") or "retire").strip().lower()
+        reason = (args.get("reason") or "").strip()
+        if action not in ("retire", "restore"):
+            return "action должен быть 'retire' или 'restore'."
+        if len(text) < 10:
+            return "Дай фрагмент памяти подлиннее (10+ символов), иначе можно задеть чужой факт."
+        if action == "retire" and not reason:
+            return "Нужен reason: чем текущий контекст противоречит этому факту."
+
+        from hindsight_client_api.models.update_memory_request import UpdateMemoryRequest
+
+        bank = self._bank_id
+        # Ищем в текущем состоянии, переводим в целевое: retire — valid -> invalidated,
+        # restore — invalidated -> valid.
+        target_state = "valid" if action == "restore" else "invalidated"
+        current_state = "invalidated" if action == "restore" else "valid"
+
+        explicit_ids = [i for i in (args.get("ids") or []) if isinstance(i, str) and i.strip()]
+        if explicit_ids:
+            items = []
+        else:
+            resp = self._run_hindsight_operation(
+                lambda c: c.alist_memories(bank_id=bank, search_query=text[:200], limit=20, state=current_state)
+            )
+            items = list(getattr(resp, "items", None) or [])
+            if not items:
+                return f"Не нашёл память по фрагменту в состоянии {current_state}: {text[:120]!r}"
+
+        def _score(item) -> float:
+            body = (getattr(item, "text", "") or "")
+            return difflib.SequenceMatcher(None, text.lower(), body.lower()).ratio()
+
+        if explicit_ids:
+            best, kind, targets = None, "ids", [(i, "fact") for i in explicit_ids]
+        else:
+            best = max(items, key=_score)
+            if text.lower() not in (getattr(best, "text", "") or "").lower() and _score(best) < 0.45:
+                cands = "\n".join(f"- {(getattr(i, 'text', '') or '')[:110]}" for i in items[:5])
+                return f"Фрагмент не совпал уверенно. Кандидаты:\n{cands}"
+            kind = getattr(best, "fact_type", None) or getattr(best, "type", None)
+            sources = list(getattr(best, "source_memory_ids", None) or [])
+            targets = [(best.id, kind)] if kind in ("world", "experience") else [(sid, "world") for sid in sources]
+            if not targets:
+                return f"У наблюдения {best.id} нет исходных фактов — гасить нечего, правь текст вручную."
+
+        done, failed = [], []
+        for mid, _ in targets:
+            try:
+                self._run_hindsight_operation(
+                    lambda c, mid=mid: c.memory.update_memory(
+                        bank_id=bank,
+                        memory_id=mid,
+                        update_memory_request=UpdateMemoryRequest(state=target_state, reason=reason or None),
+                    )
+                )
+                self._run_hindsight_operation(
+                    lambda c, mid=mid: c.memory.clear_memory_observations(bank_id=bank, memory_id=mid)
+                )
+                done.append(mid)
+            except Exception as exc:  # noqa: BLE001 - one bad id must not sink the rest
+                failed.append(f"{mid}: {type(exc).__name__}: {exc}")
+
+        _log_retire(
+            {
+                "ts": time.time(),
+                "action": action,
+                "bank": bank,
+                "fragment": text[:400],
+                "reason": reason[:400],
+                "matched_id": getattr(best, "id", None),
+                "matched_type": kind,
+                "matched_text": (getattr(best, "text", "") or "")[:400],
+                "fact_ids": done,
+                "failed": failed,
+                "session_id": getattr(self, "_session_id", "") or "",
+            }
+        )
+        verb = "погашено" if action == "retire" else "восстановлено"
+        head = f"{verb}: {len(done)} факт(ов), тип памяти {kind}."
+        tail = " Наблюдения сброшены, пересборка запущена." if action == "retire" else " Наблюдения пересоберутся."
+        if failed:
+            tail += f" Ошибки: {'; '.join(failed[:3])}"
+        matched = (getattr(best, "text", "") or "")[:200] if best is not None else text[:200]
+        # id'ы возвращаем, чтобы ошибочное гашение можно было откатить: action='restore', ids=[...]
+        ids = ", ".join(done)
+        return head + tail + f"\nФрагмент: {matched}" + (f"\nids для отката: {ids}" if done else "")
+
     # tool name -> (required arg, handler, user-facing failure prefix)
     _TOOL_HANDLERS = {
         "hindsight_retain": ("content", _tool_retain, "Failed to store memory"),
         "hindsight_recall": ("query", _tool_recall, "Failed to search memory"),
         "hindsight_reflect": ("query", _tool_reflect, "Failed to reflect"),
+        "hindsight_retire": ("text", _tool_retire, "Failed to retire memory"),
     }
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
@@ -2209,6 +2482,7 @@ class HindsightMemoryProvider(MemoryProvider):
         with self._prefetch_lock:
             self._prefetch_generation += 1  # a worker still running past the join must not land here
             self._prefetch_result = ""
+            self._prefetch_items, self._prefetch_query = [], ""
 
         # 3. Rotate to the new session.
         if parent_session_id:
